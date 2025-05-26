@@ -1,6 +1,5 @@
 package com.metl_group.smart_item_deleter;
 
-import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.phys.AABB;
@@ -26,8 +25,6 @@ import java.util.List;
 import net.minecraft.world.level.ChunkPos;     // für chunk.getPos()
 import net.minecraft.world.level.chunk.LevelChunk; // für getTickingChunk()
 import net.minecraft.server.level.ServerPlayer;
-
-import com.metl_group.smart_item_deleter.ModConfig;
 
 
 // The value here should match an entry in the META-INF/neoforge.mods.toml file
@@ -63,7 +60,7 @@ public class SmartItemDeleter {
     }
 
     private static final int CHECK_INTERVAL = 20;
-    private static final int VANILLA_DESPAWN_TICKS = 6000;
+    //private static final int VANILLA_DESPAWN_TICKS = 6000;
     private int tickCounter = 0;
     private boolean isThresholdBreached = false;
 

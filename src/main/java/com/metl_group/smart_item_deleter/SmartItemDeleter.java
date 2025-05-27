@@ -1,30 +1,29 @@
 package com.metl_group.smart_item_deleter;
 
+import com.mojang.logging.LogUtils;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.phys.AABB;
-
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.ModContainer;
-import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.event.lifecycle.FMLClientSetupEvent;
 import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.neoforged.neoforge.common.NeoForge;
-import net.neoforged.neoforge.event.server.ServerStartingEvent;
 import net.neoforged.neoforge.event.tick.LevelTickEvent;
-
-import com.mojang.logging.LogUtils;
 import org.slf4j.Logger;
 
+import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
-
-import net.minecraft.world.level.ChunkPos;     // für chunk.getPos()
-import net.minecraft.world.level.chunk.LevelChunk; // für getTickingChunk()
-import net.minecraft.server.level.ServerPlayer;
 
 
 // The value here should match an entry in the META-INF/neoforge.mods.toml file
@@ -44,7 +43,6 @@ public class SmartItemDeleter {
         // Do not add this line if there are no @SubscribeEvent-annotated functions in this class, like onServerStarting() below.
         NeoForge.EVENT_BUS.register(this);
         // Register our mod's ModConfigSpec so that FML can create and load the config file for us
-        //modContainer.registerConfig(net.neoforged.fml.config.ModConfig.Type.COMMON, Config.SPEC);
         modContainer.registerConfig(net.neoforged.fml.config.ModConfig.Type.COMMON, ModConfig.SPEC);
     }
 
@@ -53,102 +51,86 @@ public class SmartItemDeleter {
         LOGGER.info("HELLO FROM SMART ITEM DELETER");
     }
 
-
-    // You can use SubscribeEvent and let the Event Bus discover methods to call
-    @SubscribeEvent
-    public void onServerStarting(ServerStartingEvent event) {
-    }
-
     private static final int CHECK_INTERVAL = 20;
-    //private static final int VANILLA_DESPAWN_TICKS = 6000;
     private int tickCounter = 0;
     private boolean isThresholdBreached = false;
 
-    @SubscribeEvent
-    public void onWorldTick(LevelTickEvent.Post event) {
+    private static final Method CHUNKMAP_GET_CHUNKS;
+
+    static {
+        try {
+            Class<?> cmClass = Class.forName("net.minecraft.server.level.ChunkMap");
+            CHUNKMAP_GET_CHUNKS = cmClass.getDeclaredMethod("getChunks");
+            CHUNKMAP_GET_CHUNKS.setAccessible(true);
+        } catch (Exception e) {
+            throw new RuntimeException("Unable to initialize ChunkMap reflection", e);
+        }
     }
 
-    private List<ItemEntity> getAllItemEntities(ServerLevel level) {
-        List<ItemEntity> all = new ArrayList<>();
-
-        int radius = level.getServer().getPlayerList().getViewDistance(); // oder fix: 10
-        int minY = level.getMinBuildHeight();
-        int maxY = level.getMaxBuildHeight();
-
-        for (ServerPlayer player : level.players()) {
-            ChunkPos center = player.chunkPosition();
-
-            for (int dx = -radius; dx <= radius; dx++) {
-                for (int dz = -radius; dz <= radius; dz++) {
-                    ChunkPos pos = new ChunkPos(center.x + dx, center.z + dz);
-                    LevelChunk chunk = level.getChunkSource().getChunkNow(pos.x, pos.z);
-                    if (chunk != null) {
-                        AABB area = new AABB(
-                                pos.getMinBlockX(), minY, pos.getMinBlockZ(),
-                                pos.getMaxBlockX(), maxY, pos.getMaxBlockZ()
-                        );
-                        all.addAll(level.getEntitiesOfClass(ItemEntity.class, area));
-                    }
-                }
-            }
+    @SuppressWarnings("unchecked")
+    private Iterable<ChunkHolder> getLoadedChunkHolders(ServerLevel level) {
+        try {
+            Object chunkMap = level.getChunkSource()
+                    .getClass()
+                    .getField("chunkMap")
+                    .get(level.getChunkSource());
+            return (Iterable<ChunkHolder>) CHUNKMAP_GET_CHUNKS.invoke(chunkMap);
+        } catch (Exception e) {
+            LOGGER.error("cleanup: cannot access chunkMap", e);
+            return Collections.emptyList();
         }
-
-        return all;
     }
 
     @SubscribeEvent
     public void onLevelTick(LevelTickEvent.Post event) {
         if (event.getLevel().isClientSide()) return;
-
-        tickCounter++;
-        if (tickCounter < CHECK_INTERVAL) return;
+        if (++tickCounter < CHECK_INTERVAL) return;
         tickCounter = 0;
 
         ServerLevel level = (ServerLevel) event.getLevel();
-        List<ItemEntity> allItems = getAllItemEntities(level);
+
+        List<ItemEntity> allItems = new ArrayList<>();
+        for (ServerLevel lvl : level.getServer().getAllLevels()) {
+            for (ChunkHolder h : getLoadedChunkHolders(lvl)) {
+                LevelChunk c = h.getTickingChunk();
+                if (c == null) continue;
+                ChunkPos pos = c.getPos();
+                AABB box = new AABB(
+                        pos.getMinBlockX(), lvl.getMinBuildHeight(), pos.getMinBlockZ(),
+                        pos.getMaxBlockX(), lvl.getMaxBuildHeight(), pos.getMaxBlockZ()
+                );
+                allItems.addAll(lvl.getEntitiesOfClass(ItemEntity.class, box));
+            }
+        }
+        //LOGGER.info("SID: scanned {} items across dimensions", allItems.size());
 
         int threshold = ModConfig.thresholdCached;
-
         if (allItems.size() <= threshold) {
             isThresholdBreached = false;
             return;
         }
-
-        // Nur ausführen, wenn Threshold überschritten wurde und vorher nicht
         if (isThresholdBreached) return;
         isThresholdBreached = true;
 
-        int targetCount = threshold / 2;
+        int keepPercent = ModConfig.keepPercentCached;
+        int targetCount = (int) Math.ceil(threshold * (keepPercent / 100.0));
 
-        // Sortiere: älteste Items zuerst
         allItems.sort((a, b) -> Integer.compare(b.getAge(), a.getAge()));
-
         int removed = 0;
         for (ItemEntity item : allItems) {
             if (allItems.size() - removed <= targetCount) break;
-            if (!item.isRemoved()) {
-                item.discard();
-                removed++;
-            }
+            item.discard();
+            removed++;
         }
 
-        LOGGER.info("SmartItemDeleter: removed {} ItemEntities (threshold exceeded: {} → {})",
-                removed, allItems.size(), allItems.size() - removed);
+        LOGGER.info("SID: removed {} items, kept {}%", removed, keepPercent);
 
-        //Log information to Chat for Debugging
-        /*
-        for (ServerPlayer player : level.players()) {
-            player.sendSystemMessage(
-                    Component.literal(
-                            String.format(
-                                    "SmartItemDeleter Debug – gefunden: %d Items, gelöscht: %d",
-                                    allItems.size(),
-                                    removed
-                            )
-                    )
+        if (ModConfig.debugCached) {
+            Component msg = Component.literal(
+                    String.format("SID Debug – found: %d, removed: %d", allItems.size(), removed)
             );
+            level.players().forEach(p -> p.sendSystemMessage(msg));
         }
-        */
     }
 
     // You can use EventBusSubscriber to automatically register all static methods in the class annotated with @SubscribeEvent
